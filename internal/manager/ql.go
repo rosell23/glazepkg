@@ -8,24 +8,49 @@ import (
 	"github.com/neur0map/glazepkg/internal/model"
 )
 
-type Quicklisp struct{}
-
-func (q *Quicklisp) Name() model.Source { return model.SourceQuicklisp }
-
-func (q *Quicklisp) Available() bool {
-	return commandExists("sbcl")
+type LispImpl struct {
+	Name string // e.g. sbcl, ccl, clisp, ecl, abcl
+	Path string // $ which LispImpl.Name || wrapper
 }
 
-func runSBCL(exprs ...string) ([]byte, error) {
-	args := []string{"--noinform", "--non-interactive"}
+func (l LispImpl) BuildCmd(exprs ...string) *exec.Cmd {
+	// ABCL is JVM-based
+	if l.Name == "abcl" {
+		args := []string{"-jar", l.Path}
+		for _, e := range exprs {
+			args = append(args, "--eval", e)
+		}
+		return exec.Command("java", args...)
+	}
+
+	args := []string{}
 	for _, e := range exprs {
 		args = append(args, "--eval", e)
 	}
-	return exec.Command("sbcl", args...).Output()
+
+	args = append([]string{"--noinform", "--non-interactive"}, args...)
+
+	return exec.Command(l.Path, args...)
+}
+
+type Quicklisp struct {
+	Impl LispImpl
+}
+
+func (q *Quicklisp) Name() model.Source {
+	return model.SourceQuicklisp
+}
+
+func (q *Quicklisp) Available() bool {
+	return commandExists(q.Impl.Path)
+}
+
+func (q *Quicklisp) run(exprs ...string) ([]byte, error) {
+	return q.Impl.BuildCmd(exprs...).Output()
 }
 
 func (q *Quicklisp) Scan() ([]model.Package, error) {
-	out, err := runSBCL(
+	out, err := q.run(
 		"(require :asdf)",
 		`(mapcar #'prin1-to-string (asdf:registered-systems))`,
 	)
@@ -38,15 +63,15 @@ func (q *Quicklisp) Scan() ([]model.Package, error) {
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		line = strings.Trim(line, "()\"")
+		name := strings.TrimSpace(scanner.Text())
+		name = strings.Trim(name, "()\"")
 
-		if line == "" {
+		if name == "" {
 			continue
 		}
 
 		pkgs = append(pkgs, model.Package{
-			Name:   line,
+			Name:   name,
 			Source: model.SourceQuicklisp,
 		})
 	}
@@ -55,7 +80,7 @@ func (q *Quicklisp) Scan() ([]model.Package, error) {
 }
 
 func (q *Quicklisp) Search(query string) ([]model.Package, error) {
-	out, err := runSBCL(
+	out, err := q.run(
 		"(require :quicklisp)",
 		`(ql:system-apropos "`+query+`")`,
 	)
@@ -79,8 +104,9 @@ func (q *Quicklisp) Search(query string) ([]model.Package, error) {
 		}
 
 		pkgs = append(pkgs, model.Package{
-			Name:   name,
-			Source: model.SourceQuicklisp,
+			Name:        name,
+			Description: line,
+			Source:      model.SourceQuicklisp,
 		})
 	}
 
@@ -88,22 +114,35 @@ func (q *Quicklisp) Search(query string) ([]model.Package, error) {
 }
 
 func (q *Quicklisp) InstallCmd(name string) *exec.Cmd {
-	return sbclCmdQuicklisp(`(ql:quickload "` + name + `")`)
+	return q.Impl.BuildCmd(
+		"(require :quicklisp)",
+		`(ql:quickload "`+name+`")`,
+	)
 }
 
 func (q *Quicklisp) RemoveCmd(name string) *exec.Cmd {
-	return sbclCmdQuicklisp(`(ignore-errors (ql:uninstall-system "` + name + `"))`)
+	return q.Impl.BuildCmd(
+		"(require :quicklisp)",
+		`(ignore-errors (ql:uninstall-system "`+name+`"))`,
+	)
 }
 
 func (q *Quicklisp) UpgradeCmd(name string) *exec.Cmd {
 	if name == "" {
-		return sbclCmdQuicklisp("(ql:update-all-dists)")
+		return q.Impl.BuildCmd(
+			"(require :quicklisp)",
+			"(ql:update-all-dists)",
+		)
 	}
-	return sbclCmdQuicklisp(`(ql:update-dist "` + name + `")`)
+
+	return q.Impl.BuildCmd(
+		"(require :quicklisp)",
+		`(ql:update-dist "`+name+`")`,
+	)
 }
 
 func (q *Quicklisp) CheckUpdates(pkgs []model.Package) map[string]string {
-	out, err := runSBCL(
+	out, err := q.run(
 		"(require :quicklisp)",
 		"(ql:update-all-dists :prompt nil)",
 	)
@@ -119,9 +158,9 @@ func (q *Quicklisp) CheckUpdates(pkgs []model.Package) map[string]string {
 		line := scanner.Text()
 
 		if strings.Contains(line, "Updating") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				name := parts[len(parts)-1]
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				name := fields[len(fields)-1]
 				updates[name] = "latest"
 			}
 		}
@@ -134,7 +173,7 @@ func (q *Quicklisp) Describe(pkgs []model.Package) map[string]string {
 	descs := make(map[string]string)
 
 	for _, pkg := range pkgs {
-		out, err := runSBCL(
+		out, err := q.run(
 			"(require :asdf)",
 			`(let ((sys (asdf:find-system "`+pkg.Name+`" nil)))
 			 (when sys
@@ -155,7 +194,7 @@ func (q *Quicklisp) ListDependencies(pkgs []model.Package) map[string][]string {
 	deps := make(map[string][]string)
 
 	for _, pkg := range pkgs {
-		out, err := runSBCL(
+		out, err := q.run(
 			"(require :asdf)",
 			`(let ((sys (asdf:find-system "`+pkg.Name+`" nil)))
 			 (when sys
@@ -185,14 +224,5 @@ func (q *Quicklisp) ListDependencies(pkgs []model.Package) map[string][]string {
 	}
 
 	return deps
-}
-
-func sbclCmdQuicklisp(expr string) *exec.Cmd {
-	return exec.Command("sbcl",
-		"--noinform",
-		"--non-interactive",
-		"--eval", "(require :quicklisp)",
-		"--eval", expr,
-	)
 }
 
