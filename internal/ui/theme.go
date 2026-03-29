@@ -90,6 +90,7 @@ func defaultManagerColorMap() map[model.Source]lipgloss.Color {
 		model.SourceWindowsUpdates: ColorRed,
 		model.SourceMaven:          ColorOrange,
 		model.SourceUv:             ColorPurple,
+		model.SourceQuicklisp:      ColorWhite,
 	}
 }
 
